@@ -47,6 +47,7 @@ describe("API request validation", () => {
     "blockedEvidence",
     "mhtml",
     "ignoreCertificateErrors",
+    "favicons",
   ] as const) {
     test(`accepts boolean ${field} flags and rejects other values`, () => {
       expect(() => validateScrapeRequest({ url: "https://example.com", [field]: true })).not.toThrow()

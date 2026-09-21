@@ -69,6 +69,12 @@ export interface ScrapeRequest {
   // instead of returned — see `certificateError` and the crossed-landing guard in
   // @trawl/tiers.
   ignoreCertificateErrors?: boolean
+  // Opt-in favicon collection from the browser tiers (2-4), returned as
+  // `ScrapeResult.favicons`. The apex `/favicon.ico` and every declared
+  // `<link rel~="icon">` are fetched from inside the page, so they carry the origin's
+  // cookies and the session's challenge clearance. Off by default: it costs one request
+  // per icon.
+  favicons?: boolean
 }
 
 // One browser console message. Shaped after WebDriver's browser log so a consumer can
@@ -108,6 +114,18 @@ export interface CapturedResponseEntry {
   body: string | null
   base64Encoded: boolean
   truncated: boolean
+  error?: string
+}
+
+// One of the page's favicons, fetched from inside the page. `data` is base64 with no
+// `data:` prefix and is absent when the icon could not be read, in which case `error`
+// says why — "no icon there" and "we could not fetch it" are different answers, and
+// collapsing them is what hides a favicon the site serves but the scraper never gets.
+// `url` is the absolute icon URL, or `data:<mime>` for an inline icon.
+export interface FaviconEntry {
+  url: string
+  contentType?: string
+  data?: string
   error?: string
 }
 
@@ -185,6 +203,10 @@ export interface ScrapeResult {
   // verified attempt was made (`skipHttp`) — absence is "not observed", not proof that the
   // certificate was valid.
   certificateError?: string
+  // The page's favicons, apex `/favicon.ico` first and then the declared icons in
+  // document order. Present (possibly empty) only when the request asked for them and a
+  // browser tier served the page.
+  favicons?: FaviconEntry[]
 }
 
 export interface SessionData {

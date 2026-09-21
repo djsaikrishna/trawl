@@ -330,6 +330,25 @@ on. Capturing it never fails the scrape, and screenshots cannot extend the reque
 Challenge markup and screenshots can contain tokens, credentials or personal data; avoid
 logging, persisting or publicly exposing them unless that is explicitly intended.
 
+## Favicons
+
+Only read when a request sets `favicons: true` — see
+[Native API](/api-reference/native-api#favicons). Without it no icon is resolved and no
+request is made.
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `FAVICON_MAX_ENTRIES` | `8` | Icons fetched per page, apex first then declared in document order |
+| `FAVICON_MAX_BYTES` | `524288` | Largest single icon kept. Declared oversize bodies are refused; unknown-size bodies are streamed and cancelled when they cross the cap |
+| `FAVICON_MAX_METADATA_CHARS` | `8192` | Maximum characters kept for an icon URL, content type, or error message |
+| `FAVICON_FETCH_TIMEOUT_MS` | `5000` | Maximum wait for one icon |
+| `FAVICON_TIMEOUT_MS` | `20000` | Ceiling on the whole collection; the request's own remaining `maxTimeout` also caps it, and collection is skipped once that budget is spent |
+
+An icon that could not be read is returned with `error` set rather than dropped, and a
+collection failure leaves `favicons` empty and never fails the scrape.
+Tier 1 has no page context and therefore never produces icons; use `skipHttp: true` when the
+response must contain the requested favicon collection.
+
 ## MHTML Archives
 
 Only read when a request sets `mhtml: true` — see
