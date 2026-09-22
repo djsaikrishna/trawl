@@ -1,5 +1,7 @@
+import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from "node:zlib"
 import { FINGERPRINT } from "@trawl/browser"
 import type { TierResult } from "@trawl/types"
+import { describeCertificateError, isCertificateError } from "../utils/certificate"
 import type { ChallengeType } from "../utils/detect"
 import {
   getAwsWafAction,
@@ -32,11 +34,39 @@ export interface Tier1Result extends TierResult {
   responseHeaders?: Record<string, string>
   contentType?: string
   statusCode?: number
+  // Why a TLS hop's certificate failed verification. Carried onto the unverified
+  // retry's result so the fact survives the retry.
+  certificateError?: string
 }
 
 // Methods that may carry a request body per RFC 7231/9341. CONNECT is excluded
 // (tunneling verb), TRACE/GET/HEAD/OPTIONS excluded (no body semantics).
 const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH", "DELETE", "QUERY"])
+
+const decodeResponseBody = (body: Uint8Array, contentEncoding?: string): Uint8Array => {
+  const encodings = (contentEncoding ?? "")
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter((encoding) => encoding.length > 0 && encoding !== "identity")
+
+  if (encodings.length === 0) return body
+
+  try {
+    let decoded = Buffer.from(body)
+    for (const encoding of encodings.reverse()) {
+      if (encoding === "gzip" || encoding === "x-gzip") decoded = gunzipSync(decoded)
+      else if (encoding === "deflate") decoded = inflateSync(decoded)
+      else if (encoding === "br") decoded = brotliDecompressSync(decoded)
+      else if (encoding === "zstd") decoded = zstdDecompressSync(decoded)
+      else return body
+    }
+    return decoded
+  } catch {
+    // Challenge inspection is best effort. Keep the original representation
+    // intact when an upstream sends malformed or unsupported encoded bytes.
+    return body
+  }
+}
 
 export async function runTier1(
   url: string,
@@ -45,8 +75,10 @@ export async function runTier1(
   body?: string,
   proxy?: string,
   validateOutboundUrl?: OutboundUrlValidator,
+  ignoreCertificateErrors?: boolean,
 ): Promise<Tier1Result> {
   const start = Date.now()
+  let certificateError: string | undefined
   try {
     const m = (method ?? "GET").toUpperCase()
     const headers = {
@@ -64,14 +96,33 @@ export async function runTier1(
     let res: Response
     for (let redirects = 0; ; redirects++) {
       await validateOutboundUrl?.(currentUrl)
-      res = await fetch(currentUrl, {
-        method: currentMethod,
-        body: currentBody,
-        headers,
-        redirect: validateOutboundUrl ? "manual" : "follow",
-        ...(proxy ? { proxy } : {}),
-      })
-      if (!validateOutboundUrl || ![301, 302, 303, 307, 308].includes(res.status)) break
+      const fetchHop = (insecure: boolean) =>
+        fetch(currentUrl, {
+          method: currentMethod,
+          body: currentBody,
+          headers,
+          // Manual redirects let an opted-in request retry only the TLS hop that failed.
+          // Restarting from the original URL could submit a successful POST twice when a
+          // later redirect target has an invalid certificate.
+          redirect: validateOutboundUrl || ignoreCertificateErrors ? "manual" : "follow",
+          // Tier 1 feeds the MITM proxy, so its body must keep the same encoded
+          // representation described by Content-Encoding, validators, and ranges.
+          decompress: false,
+          ...(proxy ? { proxy } : {}),
+          ...(insecure ? { tls: { rejectUnauthorized: false } } : {}),
+        })
+
+      try {
+        res = await fetchHop(false)
+      } catch (err) {
+        if (!ignoreCertificateErrors || !isCertificateError(err)) throw err
+        certificateError ??= describeCertificateError(err)
+        res = await fetchHop(true)
+      }
+
+      if (!(validateOutboundUrl || ignoreCertificateErrors) || ![301, 302, 303, 307, 308].includes(res.status)) {
+        break
+      }
       const location = res.headers.get("location")
       if (!location) break
       if (redirects >= 9) throw new Error("Too many redirects")
@@ -97,6 +148,7 @@ export async function runTier1(
     if (proxyFailure) {
       return {
         tier: 1,
+        certificateError,
         status: "error",
         durationMs: Date.now() - start,
         reason: proxyFailure,
@@ -110,6 +162,7 @@ export async function runTier1(
     if (awsAction) {
       return {
         tier: 1,
+        certificateError,
         status: awsAction === "captcha" ? "blocked" : "needs-js",
         durationMs: Date.now() - start,
         reason: awsAction === "captcha" ? "aws-waf-captcha-required" : "aws-waf-challenge",
@@ -121,20 +174,21 @@ export async function runTier1(
       }
     }
 
-    // Preserve raw bytes — required for binary content (.torrent, images, etc.).
-    // The MITM proxy (:8192) consumes `body`; /scrape still consumes `html`.
+    // Preserve encoded representation bytes for the MITM proxy and binary
+    // content. Decode a separate view for challenge inspection and `/scrape`'s
+    // text-only `html` field without invalidating the upstream response headers.
     const rawBytes = new Uint8Array(await res.arrayBuffer())
+    const decodedBytes = decodeResponseBody(rawBytes, responseHeaders["content-encoding"])
 
-    // Decode a bounded preview losslessly for challenge detection — keeps the original
-    // byte buffer untouched. `fatal: false` replaces invalid sequences with U+FFFD
-    // so detection helpers don't throw on non-UTF8 payloads. 64 KiB covers deep head
-    // and script tags in dynamic challenge pages (e.g. ALTCHA / PoW widgets).
-    const previewLen = Math.min(rawBytes.length, 65536)
-    const previewText = new TextDecoder("utf-8", { fatal: false }).decode(rawBytes.subarray(0, previewLen))
+    // Decode a bounded text preview losslessly. `fatal: false` replaces invalid
+    // sequences with U+FFFD so detection helpers don't throw on non-UTF8 data.
+    const previewLen = Math.min(decodedBytes.length, 65536)
+    const previewText = new TextDecoder("utf-8", { fatal: false }).decode(decodedBytes.subarray(0, previewLen))
 
     if (isCloudflarePage(previewText, responseHeaders)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "cloudflare-challenge",
@@ -149,6 +203,7 @@ export async function runTier1(
     if (hasDuckDuckGoChallenge(previewText, responseHeaders)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "duckduckgo-anomaly-challenge",
@@ -168,6 +223,7 @@ export async function runTier1(
     if (hasHcaptcha(previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "hcaptcha-shell",
@@ -181,6 +237,7 @@ export async function runTier1(
     if (hasRecaptcha(previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "recaptcha-shell",
@@ -194,6 +251,7 @@ export async function runTier1(
     if (hasTurnstile(previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "turnstile-shell",
@@ -207,6 +265,7 @@ export async function runTier1(
     if (hasAltcha(previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "altcha-shell",
@@ -220,6 +279,7 @@ export async function runTier1(
     if (hasFriendlyCaptcha(previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "friendly-captcha-shell",
@@ -233,6 +293,7 @@ export async function runTier1(
     if (hasAkamaiChallenge(previewText, responseHeaders)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "akamai-interstitial",
@@ -246,6 +307,7 @@ export async function runTier1(
     if (hasAwsWafCaptcha(previewText, responseHeaders, res.status)) {
       return {
         tier: 1,
+        certificateError,
         status: "blocked",
         durationMs: Date.now() - start,
         reason: "aws-waf-captcha-required",
@@ -259,6 +321,7 @@ export async function runTier1(
     if (hasAwsWafChallenge(previewText, responseHeaders, res.status)) {
       return {
         tier: 1,
+        certificateError,
         status: "needs-js",
         durationMs: Date.now() - start,
         reason: "aws-waf-challenge",
@@ -277,6 +340,7 @@ export async function runTier1(
     if (dataDomeAction) {
       return {
         tier: 1,
+        certificateError,
         status: dataDomeAction === "interstitial" ? "needs-js" : "blocked",
         durationMs: Date.now() - start,
         reason:
@@ -296,6 +360,7 @@ export async function runTier1(
     if (isBlocked(res.status, previewText)) {
       return {
         tier: 1,
+        certificateError,
         status: "blocked",
         durationMs: Date.now() - start,
         reason: `http-${res.status}`,
@@ -308,6 +373,7 @@ export async function runTier1(
 
     return {
       tier: 1,
+      certificateError,
       status: "success",
       durationMs: Date.now() - start,
       effectiveUrl: res.url,
@@ -318,7 +384,9 @@ export async function runTier1(
       // full buffer, reusing the preview only when it already covers the whole body.
       html: isTextContentType(contentType)
         ? normalizeHtml(
-            rawBytes.length > previewLen ? new TextDecoder("utf-8", { fatal: false }).decode(rawBytes) : previewText,
+            decodedBytes.length > previewLen
+              ? new TextDecoder("utf-8", { fatal: false }).decode(decodedBytes)
+              : previewText,
           )
         : "",
       body: rawBytes,
@@ -332,6 +400,7 @@ export async function runTier1(
       status: "error",
       durationMs: Date.now() - start,
       reason: proxy ? normalizeProxyError(err) : err instanceof Error ? err.message : String(err),
+      certificateError: certificateError ?? (isCertificateError(err) ? describeCertificateError(err) : undefined),
     }
   }
 }

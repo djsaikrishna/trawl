@@ -27,6 +27,8 @@ interface ScrapeRequest {
   waitForSelector?: string               // CSS selector that ends the settle window early
   blockedEvidence?: boolean              // return the challenge wall on the error, default false
   mhtml?: boolean                        // assemble an MHTML archive of the page, default false
+  ignoreCertificateErrors?: boolean      // load the page even if its TLS certificate fails verification, default false
+  favicons?: boolean                     // fetch the page's declared icons from inside the page, default false
 }
 ```
 
@@ -50,9 +52,11 @@ interface ScrapeRequest {
 | `waitForSelector` | string | —    | CSS selector that also ends the settle window early. Only read alongside `captureResponses`                                                                                                 |
 | `blockedEvidence` | boolean | false | When no tier clears the challenge, attach the wall the last browser tier stopped at to the 500 body as `blockedEvidence`. It is never attached to a successful result — see the note below. The image rides along only when `screenshot` is also set |
 | `mhtml` | boolean | false        | Assemble a `multipart/related` MHTML archive of the page on the browser tiers (2–4) and return it as `mhtml`. An approximation of "Save as MHTML", not an engine snapshot — see the note below |
+| `ignoreCertificateErrors` | boolean | false | Load the page even when its TLS certificate fails verification (expired, self-signed, issued for another host) instead of failing the fetch. Off by default, so every other caller keeps a verified connection. An unverified connection no longer proves whose page came back, so the request also gets the crossed-landing guard — see the note below |
+| `favicons` | boolean | false | Fetch the apex `/favicon.ico` and every declared link whose `rel` contains `icon` from inside the page on the browser tiers (2–4) and return them as `favicons`. Tier 1 never produces them; use `skipHttp: true` to force a browser attempt — see the note below |
 
 Captured response bodies, headers, console messages, URLs, blocked-page HTML, screenshots,
-and MHTML archives can contain credentials, tokens, personal data, or active scripts.
+favicons, and MHTML archives can contain credentials, tokens, personal data, or active scripts.
 Treat these opt-in fields as sensitive and open archives only when you trust their source.
 
 ## Response
@@ -76,6 +80,8 @@ interface ScrapeResult {
   redirectChain?: string[]     // URLs the main document walked, same presence rules as consoleLogs
   capturedResponses?: CapturedResponseEntry[]  // matched response bodies, [] when nothing matched
   mhtml?: string               // bounded multipart/related archive, only for requested successful HTML browser results
+  certificateError?: string    // why the certificate failed verification, only when ignoreCertificateErrors was set and a verified attempt observed it
+  favicons?: FaviconEntry[]    // the page's icons, only when requested and a browser tier served the page
 }
 
 interface ConsoleLogEntry {
@@ -104,6 +110,13 @@ interface CapturedResponseEntry {
   base64Encoded: boolean
   truncated: boolean           // body trimmed to CAPTURE_MAX_BODY_BYTES
   error?: string               // why the body is null (read failed, budget spent, ...)
+}
+
+interface FaviconEntry {
+  url: string                  // absolute icon URL, or `data:<mime>` for an inline icon
+  contentType?: string         // the icon response's Content-Type
+  data?: string                // base64 bytes, no data: prefix; absent when the icon could not be read
+  error?: string               // why `data` is absent (http-403, a fetch error, a byte cap, ...)
 }
 
 interface TierResult {
@@ -169,6 +182,90 @@ The field is excluded from `timings` and tier telemetry. Bounds are tunable via 
 MHTML may contain credentials, personal data and executable JavaScript from the target.
 Treat it as sensitive untrusted content; do not log it or open it outside an appropriate
 sandbox unless you trust the page.
+
+## Invalid Certificates
+
+`ignoreCertificateErrors: true` lets a page load even though a certificate in its redirect
+chain is expired, self-signed or issued for another host — without it the fetch fails
+outright and nothing about the page is readable. The relaxation is per request: Tier 1
+retries only the TLS hop whose verified attempt failed, Tiers 3 and 4 set it on the temporary
+context they create for that one request, and the pooled contexts every other caller uses
+stay verified. Tier 2 is skipped for these requests (it replays its session
+inside the shared pool context, whose TLS policy cannot be changed per request) and shows up
+in `timings` as `skipped`.
+
+When a verified Tier 1 hop failed, its reason comes back as `certificateError`, e.g.
+`"DEPTH_ZERO_SELF_SIGNED_CERT: self signed certificate"`. The field is absent when the
+certificate verified, when the flag was not set, and when no verified attempt was made
+(`skipHttp: true`) — absence means "not observed", not "the certificate was valid".
+
+### The crossed-landing guard
+
+A verified certificate is what normally proves the bytes came from the host that was asked
+for. With verification off, a connection that reaches the wrong origin would be accepted in
+silence and another site's page returned under the requested domain's name. So an opted-in
+request also runs a landing check: if the scrape ends on a host the requested URL is not part
+of, TRAWL fetches the same URL over the same egress with a plain HTTP client. Only when that
+probe stays on the requested host is the landing treated as crossed; the tier's attempt is
+recorded as `crossed-landing on <host>` and the ladder moves to the next tier, which reaches
+the origin over a different egress. A probe that fails, or that lands off-host as well (an
+ordinary redirect, or cloaking), is inconclusive and the page is kept. The same off-host
+landing reached from two independent egresses is taken as a redirect only a browser performs
+and accepted. The probe runs inside what is left of the request's `maxTimeout`, sharing one
+deadline across every redirect, and it validates every hop against the same outbound policy
+the tiers enforce. A spent budget makes the check inconclusive instead of starting new I/O.
+If no tier returns an uncrossed page the request fails, and the error names the refused
+landing rather than returning another site's page.
+
+An unverified page is untrusted content by definition. The guard establishes only that the
+connection reached the host that was asked for; it says nothing about whether that host is
+who it claims to be, which is exactly what the unverified certificate failed to establish.
+
+## Favicons
+
+A page may declare several icons — size and device variants, `apple-touch-icon`,
+`mask-icon`, `shortcut icon` — and the browser renders exactly one of them. `favicons: true`
+returns the whole declared set instead, plus the apex icon, so a caller that wants the
+icons a site actually publishes is not limited to the one that happened to fit a tab.
+
+They are fetched **from inside the page**, via `fetch()` in the document's own context, so
+each request carries the origin's cookies, the session's challenge clearance and the same
+egress the page itself was served over. Fetching an icon afterwards from outside the browser
+arrives as a stranger with none of that, which is what a bot wall answers 403 to.
+
+Two things are collected, in this order:
+
+1. The apex `/favicon.ico`, whether or not the page declares it. It is what a browser falls
+   back to, and a headless browser paints no tab — so it requests at most the single icon it
+   would have drawn and never the apex one. A page declaring no icon at all yields nothing
+   whatsoever on the response stream.
+2. Every `<link>` whose `rel` contains `icon` — so `apple-touch-icon`, `mask-icon`,
+   `shortcut icon` and `alternate icon` all count — resolved against the document base. An
+   inline `data:` icon is fetched the same way and reported as `data:<mime>`: its href is the
+   payload rather than a name, and repeating it next to the bytes decoded from it would carry
+   the icon twice.
+
+Duplicates are collapsed, and an icon that could not be read is still returned, with `data`
+absent and `error` set, so "the site declares no icon there" stays distinguishable from "we
+could not fetch it". Response bodies are read as a bounded stream: an icon declaring more
+than `FAVICON_MAX_BYTES` is refused on its `Content-Length`, and an unknown-size or dishonest
+response is cancelled as soon as its streamed bytes cross the same cap. An inline `data:`
+href too long to decode within that cap is refused before it is fetched. URLs, content types,
+and error messages are bounded separately. Collection is capped at `FAVICON_TIMEOUT_MS` and
+at whatever is left of the request's own `maxTimeout`, and is skipped once that budget is
+spent. The field is excluded from `timings` and tier telemetry.
+
+Two limits are worth knowing. The in-page `fetch` is subject to the page's CORS policy, so a
+cross-origin icon whose host sends no `Access-Control-Allow-Origin` fails and is reported as
+an error entry. And collection runs after the response listeners are drained, so these
+fetches never appear in `networkLogs`, `capturedResponses` or the MHTML archive. Bounds are
+tunable via `FAVICON_*` — see [Configuration](/getting-started/configuration#favicons).
+
+Icon bytes come from the target like any other scraped content. Treat them as untrusted:
+an `image/svg+xml` icon is a document that can carry script.
+
+Tier 1 is a plain HTTP fetch and never produces `favicons`. Set `skipHttp: true` when favicon
+collection is required rather than merely accepted when escalation reaches a browser tier.
 
 ## Examples
 

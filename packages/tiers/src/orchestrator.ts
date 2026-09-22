@@ -6,6 +6,7 @@ import { runTier2 } from "./tiers/2"
 import { runTier3 } from "./tiers/3"
 // Tier 4 (residential proxy) is dynamically imported only when needed.
 import type { runTier4 } from "./tiers/4"
+import { createCrossedLandingGuard, type LandingProbe } from "./utils/crossedLanding"
 import { normalizeHtml } from "./utils/html"
 import type { ProxyPool } from "./utils/proxyRotator"
 import { requireContentTypeForBody, sanitizeHeaders } from "./utils/sanitize"
@@ -51,6 +52,10 @@ export interface OrchestratorDeps {
   minTier?: TierResult["tier"]
   onTierAttempt?: (result: TierResult) => void
   validateOutboundUrl?: (url: string) => Promise<void>
+  // Resolves the host a plain HTTP fetch of a URL ends on, for the crossed-landing guard.
+  // Only consulted for requests that set `ignoreCertificateErrors`; defaults to a real
+  // fetch through the same egress the scrape used.
+  landingProbe?: LandingProbe
 }
 
 interface OrchestratorRunners {
@@ -102,6 +107,7 @@ export async function scrape(
     networkLogs: req.networkLogs,
     redirectChain: req.redirectChain,
     captureResponses: req.captureResponses,
+    favicons: req.favicons,
     settleTimeout: req.settleTimeout,
     waitForSelector: req.waitForSelector,
     blockedEvidence: req.blockedEvidence
@@ -126,6 +132,7 @@ export async function scrape(
       networkLogs?: unknown
       redirectChain?: unknown
       capturedResponses?: unknown
+      favicons?: unknown
       mhtml?: unknown
     },
   ) => {
@@ -136,12 +143,61 @@ export async function scrape(
       networkLogs: _networkLogs,
       redirectChain: _redirectChain,
       capturedResponses: _capturedResponses,
+      favicons: _favicons,
       mhtml: _mhtml,
       ...publicResult
     } = r
     timings.push(publicResult)
     deps.onTierAttempt?.(publicResult)
   }
+
+  // Opting out of certificate verification also opts in to the crossed-landing guard: an
+  // unverified connection no longer proves whose page came back, so a landing the requested
+  // URL demonstrably does not lead to is refused instead of returned (see crossedLanding.ts).
+  const ignoreCertificateErrors = Boolean(req.ignoreCertificateErrors)
+  const crossedGuard = ignoreCertificateErrors ? createCrossedLandingGuard(req.url, deps.landingProbe) : undefined
+  // Why certificate verification failed on a Tier 1 hop, when one was observed.
+  let certificateError: string | undefined
+  // The last landing this request refused, so the terminal error names it.
+  let crossedHost: string | undefined
+
+  // A refused landing is not a page: it is reported as a failed attempt for that tier and
+  // the ladder moves on to the next rung, which reaches the origin over a different egress.
+  const refuseCrossed = async (
+    effectiveUrl: string | undefined,
+    userAgent: string | undefined,
+    proxy: string | undefined,
+  ): Promise<string | undefined> => {
+    const host =
+      (await crossedGuard?.check(effectiveUrl, {
+        proxy,
+        userAgent,
+        ignoreCertificateErrors,
+        // The probe shares what is left of the request's budget across all of its hops.
+        timeoutMs: maxTimeout - (Date.now() - totalStart),
+        validateOutboundUrl: deps.validateOutboundUrl,
+      })) ?? undefined
+    if (host) crossedHost = host
+    return host
+  }
+
+  const crossedTiming = (result: TierResult, host: string): TierResult => ({
+    tier: result.tier,
+    status: "error",
+    durationMs: result.durationMs,
+    reason: `crossed-landing on ${host}`,
+  })
+
+  // A refused landing is the security-relevant half of any terminal failure that had one,
+  // so it is named alongside whatever the last tier reported.
+  const failure = (message: string): ScrapeError =>
+    new ScrapeError(
+      crossedHost
+        ? `${message} — refused crossed landing on ${crossedHost}: ${req.url} does not lead there and its certificate was not verified`
+        : message,
+      timings,
+      blockedEvidence,
+    )
 
   // Tier 1 is the only look at the wall that happens before a browser is checked out, so
   // it is also the only chance to pick the right kind of browser for the tiers below.
@@ -159,12 +215,17 @@ export async function scrape(
       req.body,
       tier1Proxy,
       deps.validateOutboundUrl,
+      ignoreCertificateErrors,
     )
-    emit(t1)
+    if (ignoreCertificateErrors) certificateError = t1.certificateError
+    const crossed1 = hasUsablePayload(t1)
+      ? await refuseCrossed(t1.effectiveUrl, tier1Fingerprint.userAgent, tier1Proxy)
+      : undefined
+    emit(crossed1 ? crossedTiming(t1, crossed1) : t1)
     if (explicitProxy && t1.status === "error" && t1.reason?.startsWith("proxy-")) {
       throw new ScrapeError(t1.reason, timings)
     }
-    if (hasUsablePayload(t1)) {
+    if (hasUsablePayload(t1) && !crossed1) {
       return {
         url: t1.effectiveUrl ?? req.url,
         html: normalizeHtml(t1.html ?? ""),
@@ -176,6 +237,7 @@ export async function scrape(
         timings,
         totalMs: Date.now() - totalStart,
         proxyUsed: Boolean(tier1Proxy),
+        certificateError,
         body: t1.body,
         responseHeaders: t1.responseHeaders,
         contentType: t1.contentType,
@@ -185,7 +247,7 @@ export async function scrape(
   }
 
   if (maxTier < 2) {
-    throw new ScrapeError("Max tier reached without success", timings, blockedEvidence)
+    throw failure("Max tier reached without success")
   }
 
   // Acquire browser for tiers 2-4
@@ -205,7 +267,14 @@ export async function scrape(
   try {
     // Tier 2: browser with cached session
     const session = minTier <= 2 && !explicitProxy ? await deps.loadSession(domain) : undefined
-    if (session && maxTier >= 2) {
+    if (session && maxTier >= 2 && ignoreCertificateErrors) {
+      // Tier 2 replays the cached session inside the pool's shared browser context, whose
+      // TLS policy is fixed when the browser launches and stays verified for every other
+      // caller. There is no per-request exception to make there, so the ladder goes straight
+      // to the fresh-context tiers instead of spending the session on a handshake this
+      // request has already been told to tolerate.
+      emit({ tier: 2, status: "skipped", durationMs: 0, reason: "ignore-certificate-errors-needs-fresh-context" })
+    } else if (session && maxTier >= 2) {
       const remaining = maxTimeout - (Date.now() - totalStart)
       const tier2Runner = runners.tier2 ?? runTier2
       let t2 = await tier2Runner(
@@ -235,8 +304,13 @@ export async function scrape(
           capture,
         )
       }
-      emit(t2)
-      if (hasUsablePayload(t2)) {
+      // Unreachable while the skip above stands, and kept anyway: every tier that can
+      // return a page runs the guard, so re-enabling Tier 2 here cannot quietly bypass it.
+      const crossed2 = hasUsablePayload(t2)
+        ? await refuseCrossed(t2.effectiveUrl, session.userAgent, undefined)
+        : undefined
+      emit(crossed2 ? crossedTiming(t2, crossed2) : t2)
+      if (hasUsablePayload(t2) && !crossed2) {
         if (t2.cookies && t2.cookies.length > 0) {
           await deps.saveSession(domain, {
             cookies: t2.cookies,
@@ -256,6 +330,7 @@ export async function scrape(
           totalMs: Date.now() - totalStart,
           captchasSolved: t2.captchasSolved,
           proxyUsed: false,
+          certificateError,
           body: t2.body,
           responseHeaders: t2.responseHeaders,
           contentType: t2.contentType,
@@ -264,6 +339,7 @@ export async function scrape(
           networkLogs: t2.networkLogs,
           redirectChain: t2.redirectChain,
           capturedResponses: t2.capturedResponses,
+          favicons: t2.favicons,
           mhtml: t2.mhtml,
         }
       }
@@ -272,7 +348,7 @@ export async function scrape(
     }
 
     if (maxTier < 3) {
-      throw new ScrapeError("Max tier reached without success", timings, blockedEvidence)
+      throw failure("Max tier reached without success")
     }
 
     let tier3Failure: string | undefined
@@ -298,6 +374,7 @@ export async function scrape(
           deps.validateOutboundUrl,
           req.screenshot,
           capture,
+          ignoreCertificateErrors,
         )
         if (t3.challenge === "datadome" && !handle.headful) {
           await switchToHeadful()
@@ -312,6 +389,7 @@ export async function scrape(
             deps.validateOutboundUrl,
             req.screenshot,
             capture,
+            ignoreCertificateErrors,
           )
         }
 
@@ -325,8 +403,9 @@ export async function scrape(
         )
         proxy3 = next
       }
-      emit(t3)
-      if (hasUsablePayload(t3)) {
+      const crossed3 = hasUsablePayload(t3) ? await refuseCrossed(t3.effectiveUrl, t3.userAgent, proxy3) : undefined
+      emit(crossed3 ? crossedTiming(t3, crossed3) : t3)
+      if (hasUsablePayload(t3) && !crossed3) {
         const cookies: Cookie[] = t3.cookies ?? []
         if (cookies.length > 0 && !explicitProxy) {
           await deps.saveSession(domain, {
@@ -347,6 +426,7 @@ export async function scrape(
           totalMs: Date.now() - totalStart,
           captchasSolved: t3.captchasSolved,
           proxyUsed: Boolean(proxy3),
+          certificateError,
           body: t3.body,
           responseHeaders: t3.responseHeaders,
           contentType: t3.contentType,
@@ -355,6 +435,7 @@ export async function scrape(
           networkLogs: t3.networkLogs,
           redirectChain: t3.redirectChain,
           capturedResponses: t3.capturedResponses,
+          favicons: t3.favicons,
           mhtml: t3.mhtml,
         }
       }
@@ -362,19 +443,17 @@ export async function scrape(
     }
 
     if (maxTier < 4) {
-      throw new ScrapeError("Max tier reached without success", timings, blockedEvidence)
+      throw failure("Max tier reached without success")
     }
 
     // Tier 4: residential proxy escalation — requires at least one residential proxy,
     // supplied either per-request (req.proxy) or via the configured residential pool.
     let proxy4 = forcedTier4Proxy ?? req.proxy ?? deps.residentialProxyPool?.next(domain)
     if (!proxy4) {
-      throw new ScrapeError(
+      throw failure(
         tier3Failure
           ? `Tier 3 failed (${tier3Failure}). Set RESIDENTIAL_PROXY_URL (or pass a proxy per-request) to enable Tier 4 proxy escalation.`
           : "Tier 4 requires RESIDENTIAL_PROXY_URL or a per-request proxy.",
-        timings,
-        blockedEvidence,
       )
     }
 
@@ -394,6 +473,7 @@ export async function scrape(
         deps.validateOutboundUrl,
         req.screenshot,
         capture,
+        ignoreCertificateErrors,
       )
       if (t4.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
@@ -408,6 +488,7 @@ export async function scrape(
           deps.validateOutboundUrl,
           req.screenshot,
           capture,
+          ignoreCertificateErrors,
         )
       }
 
@@ -418,8 +499,9 @@ export async function scrape(
       if (!next || next === proxy4) break
       proxy4 = next
     }
-    emit(t4)
-    if (hasUsablePayload(t4)) {
+    const crossed4 = hasUsablePayload(t4) ? await refuseCrossed(t4.effectiveUrl, t4.userAgent, proxy4) : undefined
+    emit(crossed4 ? crossedTiming(t4, crossed4) : t4)
+    if (hasUsablePayload(t4) && !crossed4) {
       const cookies: Cookie[] = t4.cookies ?? []
       if (cookies.length > 0 && !explicitProxy) {
         await deps.saveSession(domain, {
@@ -440,6 +522,7 @@ export async function scrape(
         totalMs: Date.now() - totalStart,
         captchasSolved: t4.captchasSolved,
         proxyUsed: true,
+        certificateError,
         body: t4.body,
         responseHeaders: t4.responseHeaders,
         contentType: t4.contentType,
@@ -448,11 +531,12 @@ export async function scrape(
         networkLogs: t4.networkLogs,
         redirectChain: t4.redirectChain,
         capturedResponses: t4.capturedResponses,
+        favicons: t4.favicons,
         mhtml: t4.mhtml,
       }
     }
 
-    throw new ScrapeError(`All tiers exhausted. Last failure: ${t4.reason ?? t4.status}`, timings, blockedEvidence)
+    throw failure(`All tiers exhausted. Last failure: ${t4.reason ?? t4.status}`)
   } finally {
     if (!handleReleased) deps.releaseBrowser(handle)
   }
