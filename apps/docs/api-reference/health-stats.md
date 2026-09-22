@@ -18,7 +18,7 @@ FlareSolverr-style readiness message — confirms the API process is up (does no
 ```json
 {
   "msg": "TRAWL is ready!",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "uptime": 42
 }
 ```
