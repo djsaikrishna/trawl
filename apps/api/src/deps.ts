@@ -21,6 +21,7 @@ import {
   type SessionCacheDriver,
   STALL_TIMEOUT_MS,
 } from "./config"
+import { localProxyCa } from "./proxy/localTrust"
 
 const state: {
   pool?: BrowserPool
@@ -243,6 +244,7 @@ export const getDeps = (): OrchestratorDeps => {
         .catch(() => {}) ?? Promise.resolve(),
     proxyPool,
     residentialProxyPool,
+    trustedProxyCa: localProxyCa,
     minTier: SCRAPE_MIN_TIER,
   }
 }
