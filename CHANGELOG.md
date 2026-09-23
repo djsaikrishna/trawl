@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.4] - 2026-09-23
+
+### Changed
+- Bump all application and internal package versions to `1.6.4`.
+
+### Fixed
+- Trust the active local TRAWL MITM proxy CA only for requests explicitly routed back through that listener, fixing `/v1` and `/scrape` self-proxy failures without changing system trust or weakening TLS for other proxies (#160).
+
 ## [1.6.3] - 2026-09-22
 
 ### Changed

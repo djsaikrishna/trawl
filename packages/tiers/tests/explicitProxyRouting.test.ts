@@ -198,6 +198,64 @@ describe("explicit proxy routing", () => {
     expect(saveCalls).toBe(0)
   })
 
+  test("relaxes browser certificate checks only for a proxy recognized by the caller", async () => {
+    const handle = {
+      id: 8,
+      lease: 12,
+      headful: false,
+      fingerprint: { userAgent: "browser", platform: "Linux x86_64", locale: "en-US", timezone: "UTC" },
+    } as BrowserHandle
+    const seen: boolean[] = []
+    const proxy = "http://127.0.0.1:8192"
+    const deps = unusedBrowserDeps({
+      acquireBrowser: async () => handle,
+      trustedProxyCa: async (candidate) => (candidate === proxy ? "LOCAL CA" : undefined),
+    })
+
+    const result = await scrape({ url: "https://target.example", skipHttp: true, maxTier: 3, proxy }, deps, {
+      tier3: async (...args) => {
+        seen.push(args[10] === true)
+        return {
+          tier: 3,
+          status: "success",
+          durationMs: 1,
+          html: "<html>trusted local proxy</html>",
+          userAgent: "browser",
+        }
+      },
+    })
+
+    expect(result.statusCode).toBe(200)
+    expect(seen).toEqual([true])
+  })
+
+  test("keeps strict browser certificate checks for an unrecognized explicit proxy", async () => {
+    const handle = {
+      id: 9,
+      lease: 13,
+      headful: false,
+      fingerprint: { userAgent: "browser", platform: "Linux x86_64", locale: "en-US", timezone: "UTC" },
+    } as BrowserHandle
+    let ignored = true
+    await scrape(
+      { url: "https://target.example", skipHttp: true, maxTier: 3, proxy: "http://proxy.example:8080" },
+      unusedBrowserDeps({ acquireBrowser: async () => handle, trustedProxyCa: async () => undefined }),
+      {
+        tier3: async (...args) => {
+          ignored = args[10] === true
+          return {
+            tier: 3,
+            status: "success",
+            durationMs: 1,
+            html: "<html>foreign proxy</html>",
+            userAgent: "browser",
+          }
+        },
+      },
+    )
+    expect(ignored).toBeFalse()
+  })
+
   test("does not save explicit-proxy Tier 4 cookies into the domain session cache", async () => {
     let saveCalls = 0
     const handle = {

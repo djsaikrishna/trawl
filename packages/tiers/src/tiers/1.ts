@@ -1,3 +1,4 @@
+import { rootCertificates } from "node:tls"
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from "node:zlib"
 import { FINGERPRINT } from "@trawl/browser"
 import type { TierResult } from "@trawl/types"
@@ -76,6 +77,7 @@ export async function runTier1(
   proxy?: string,
   validateOutboundUrl?: OutboundUrlValidator,
   ignoreCertificateErrors?: boolean,
+  trustedProxyCa?: string,
 ): Promise<Tier1Result> {
   const start = Date.now()
   let certificateError: string | undefined
@@ -109,6 +111,7 @@ export async function runTier1(
           // representation described by Content-Encoding, validators, and ranges.
           decompress: false,
           ...(proxy ? { proxy } : {}),
+          ...(trustedProxyCa ? { tls: { ca: [...rootCertificates, trustedProxyCa] } } : {}),
           ...(insecure ? { tls: { rejectUnauthorized: false } } : {}),
         })
 
