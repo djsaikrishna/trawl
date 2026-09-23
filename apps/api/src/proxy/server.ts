@@ -12,6 +12,7 @@ import { MitmCa } from "./ca"
 import { ChallengeCache, type ChallengeMode } from "./challengeCache"
 import { directForwardHttp, directForwardHttps, type ForwardResult } from "./directForward"
 import { writeResponse, writeResponseFromBuffer, writeResponseFromStream } from "./httpResponse"
+import { registerLocalProxy } from "./localTrust"
 import { responseFromBlockedEvidence, responseFromScrapeResult } from "./responsePolicy"
 
 // General forward proxy with browser-backed challenge escalation. HTTPS is
@@ -39,6 +40,7 @@ export interface MitmProxyHandle {
   ca: MitmCa
   server: net.Server
   tlsServers: tls.Server[]
+  unregisterTrust: () => void
 }
 
 export function startMitmProxy(opts: MitmProxyOptions): MitmProxyHandle {
@@ -96,12 +98,14 @@ export function startMitmProxy(opts: MitmProxyOptions): MitmProxyHandle {
     console.log(`[proxy] MITM forward proxy on ${opts.host}:${opts.port}  (CA: ${ca.caCertPath})`)
   })
 
-  return { ca, server, tlsServers }
+  const unregisterTrust = registerLocalProxy({ server, configuredPort: opts.port, ca: ca.caCertPem })
+  return { ca, server, tlsServers, unregisterTrust }
 }
 
 // Graceful shutdown — stops accepting new connections and closes existing ones.
 // Called from lifecycle.ts on SIGTERM/SIGINT before the browser pool shutdown.
 export async function shutdownMitmProxy(handle: MitmProxyHandle, timeoutMs = 5_000): Promise<void> {
+  handle.unregisterTrust()
   const serverClosed = new Promise<void>((resolve) => {
     if (!handle.server.listening) {
       resolve()

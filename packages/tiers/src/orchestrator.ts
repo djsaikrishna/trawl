@@ -56,6 +56,8 @@ export interface OrchestratorDeps {
   // Only consulted for requests that set `ignoreCertificateErrors`; defaults to a real
   // fetch through the same egress the scrape used.
   landingProbe?: LandingProbe
+  // Supplies a private CA only for an explicitly recognized, local proxy listener.
+  trustedProxyCa?: (proxyUrl: string) => Promise<string | undefined>
 }
 
 interface OrchestratorRunners {
@@ -88,6 +90,7 @@ export async function scrape(
   const domain = extractDomain(req.url)
   const explicitProxy = req.proxy
   const tier1Proxy = explicitProxy && /^https?:\/\//i.test(explicitProxy) ? explicitProxy : undefined
+  const trustedProxyCa = explicitProxy ? await deps.trustedProxyCa?.(explicitProxy) : undefined
   const skipTier1ForProxy = Boolean(explicitProxy && !tier1Proxy)
 
   if (minTier > maxTier) {
@@ -216,6 +219,7 @@ export async function scrape(
       tier1Proxy,
       deps.validateOutboundUrl,
       ignoreCertificateErrors,
+      trustedProxyCa,
     )
     if (ignoreCertificateErrors) certificateError = t1.certificateError
     const crossed1 = hasUsablePayload(t1)
@@ -374,7 +378,7 @@ export async function scrape(
           deps.validateOutboundUrl,
           req.screenshot,
           capture,
-          ignoreCertificateErrors,
+          ignoreCertificateErrors || Boolean(trustedProxyCa && proxy3 === explicitProxy),
         )
         if (t3.challenge === "datadome" && !handle.headful) {
           await switchToHeadful()
@@ -389,7 +393,7 @@ export async function scrape(
             deps.validateOutboundUrl,
             req.screenshot,
             capture,
-            ignoreCertificateErrors,
+            ignoreCertificateErrors || Boolean(trustedProxyCa && proxy3 === explicitProxy),
           )
         }
 
@@ -473,7 +477,7 @@ export async function scrape(
         deps.validateOutboundUrl,
         req.screenshot,
         capture,
-        ignoreCertificateErrors,
+        ignoreCertificateErrors || Boolean(trustedProxyCa && proxy4 === explicitProxy),
       )
       if (t4.challenge === "datadome" && !handle.headful) {
         await switchToHeadful()
@@ -488,7 +492,7 @@ export async function scrape(
           deps.validateOutboundUrl,
           req.screenshot,
           capture,
-          ignoreCertificateErrors,
+          ignoreCertificateErrors || Boolean(trustedProxyCa && proxy4 === explicitProxy),
         )
       }
 
