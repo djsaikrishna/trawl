@@ -364,7 +364,7 @@ image: ghcr.io/germondai/trawl:latest
 image: ghcr.io/germondai/trawl:baseline
 ```
 
-Synology note: many Synology NAS units (DSM 7.x on J4125 / older hardware) ship kernel 4.4.x, which Bun's modern runtime can't fully handle. Standard Bun requires kernel 5.1+ (5.6+ recommended); the baseline build degrades gracefully down to kernel 3.10. The `:baseline` tag is published for that case — **confirmed working** on a Synology DS920+ (Celeron J4125, DSM 7.3.2, kernel 4.4.302): the container starts cleanly, `/health` reports healthy, and it solves live Cloudflare challenges via `/v1` (see [#1](https://github.com/germondai/trawl/issues/1)). Published by independent GitHub Actions workflows: pushing a release tag such as `v1.6.4` creates `:1.6.4`, `:latest`, `:1.6.4-baseline`, and `:baseline`; the daily 02:00 UTC nightly build creates `:nightly` and `:nightly-<dev-sha>` from the latest `dev` commit.
+Synology note: many Synology NAS units (DSM 7.x on J4125 / older hardware) ship kernel 4.4.x, which Bun's modern runtime can't fully handle. Standard Bun requires kernel 5.1+ (5.6+ recommended); the baseline build degrades gracefully down to kernel 3.10. The `:baseline` tag is published for that case — **confirmed working** on a Synology DS920+ (Celeron J4125, DSM 7.3.2, kernel 4.4.302): the container starts cleanly, `/health` reports healthy, and it solves live Cloudflare challenges via `/v1` (see [#1](https://github.com/germondai/trawl/issues/1)). Published by independent GitHub Actions workflows: pushing a release tag such as `v1.6.5` creates `:1.6.5`, `:latest`, `:1.6.5-baseline`, and `:baseline`; the daily 02:00 UTC nightly build creates `:nightly` and `:nightly-<dev-sha>` from the latest `dev` commit.
 
 ## Releases & versioning
 
@@ -409,7 +409,8 @@ for pool and mounted-file examples.
 
 | Variable                         | Default                  | Description                                                                         |
 | -------------------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
-| `BROWSER_POOL_SIZE`              | `3`                      | Warm Camoufox Firefox instances                                                     |
+| `BROWSER_POOL_SIZE`              | `1`                      | Warm Camoufox Firefox instances; raise for concurrent browser solves                |
+| `LOG_LEVEL`                      | `info`                   | Operational logs: `error`, `warn`, `info`, `debug`, or `silent`                     |
 | `BROWSER_ACQUIRE_TIMEOUT_MS`     | `15000`                  | How long `acquire()` polls for a free browser before HTTP 429 is returned           |
 | `BROWSER_RECYCLE_AFTER_CONTEXTS` | `8`                      | Rolling-replace after this many Tier 3/4 contexts; set `0` to disable               |
 | `BROWSER_MAX_CONTENT_PROCESSES`  | `2`                      | Cap Firefox content processes per browser (`dom.ipc.processCount`); lowers RAM/CPU  |

@@ -90,7 +90,7 @@ const tabs: { id: Tab; label: string; hint: string }[] = [
             </div>
             <pre class="snippet-body"><code><span class="k">services:</span>
   redis:
-    <span class="k">image:</span> <span class="s">redis:8.10.1-alpine</span>
+    <span class="k">image:</span> <span class="s">redis:8.10.2-alpine</span>
     <span class="k">volumes:</span> [<span class="s">redis_data:/data</span>]
     <span class="k">healthcheck:</span>
       <span class="k">test:</span> [<span class="s">"CMD"</span>, <span class="s">"redis-cli"</span>, <span class="s">"ping"</span>]
@@ -121,7 +121,7 @@ const tabs: { id: Tab; label: string; hint: string }[] = [
             </div>
             <pre class="snippet-body"><code><span class="k">services:</span>
   redis:
-    <span class="k">image:</span> <span class="s">redis:8.10.1-alpine</span>
+    <span class="k">image:</span> <span class="s">redis:8.10.2-alpine</span>
     <span class="k">restart:</span> <span class="s">always</span>
     <span class="k">volumes:</span> [<span class="s">redis_data:/data</span>]
     <span class="k">healthcheck:</span>
